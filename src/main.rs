@@ -11,18 +11,14 @@ fn main() {
     println!("dependencies for {}: {:?}", 2, lineage.dependencies(2));
     println!("dependents for {}: {:?}", 2, lineage.dependents(2));
     println!("dependents for {}: {:?}", 5, lineage.dependents(5));
-
     println!(
         "dependencies for {}: {:?}",
         1,
         lineage.dependencies_cascade(1)
     );
-
     println!("dependencies for {}: {:?}", 0, lineage.dependencies_k(0, 4));
-
     println!("dependents for {}: {:?}", 4, lineage.dependents_cascade(4));
 
     lineage.delete(0);
-
     println!("dependents for {}: {:?}", 4, lineage.dependents_cascade(4));
 }

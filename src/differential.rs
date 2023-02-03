@@ -148,15 +148,15 @@ impl Context {
         }
     }
 
-    fn advance(&mut self) {
+    fn advance<A: Allocate>(&mut self, traces: [&mut TraceHandle; 2], worker: &mut Worker<A>) {
         self.counter += 1;
         self.input.advance_to(self.counter);
-    }
-
-    fn compact(&self, trace: &mut TraceHandle) {
         let frontier = &[self.counter];
-        trace.set_physical_compaction(AntichainRef::new(frontier));
-        trace.set_logical_compaction(AntichainRef::new(frontier));
+        for trace in traces.into_iter() {
+            (*trace).set_physical_compaction(AntichainRef::new(frontier));
+            (*trace).set_logical_compaction(AntichainRef::new(frontier));
+        }
+        worker.step_while(|| self.probe.less_than(self.input.time()));
     }
 
     fn query<A: Allocate>(
@@ -177,10 +177,7 @@ impl Context {
             lineage.trace
         });
 
-        self.advance();
-        self.compact(trace);
-        self.compact(&mut result_trace);
-        worker.step_while(|| self.probed());
+        self.advance([trace, &mut result_trace], worker);
         let mut result = self.read(&mut result_trace);
         result.pop().map(|d| d.1).unwrap_or(vec![])
     }
@@ -218,10 +215,7 @@ impl Context {
             res.trace
         });
 
-        self.advance();
-        self.compact(trace);
-        self.compact(&mut result_trace);
-        worker.step_while(|| self.probed());
+        self.advance([trace, &mut result_trace], worker);
         self.read(&mut result_trace).into_iter().collect()
     }
 
@@ -260,10 +254,7 @@ impl Context {
                 res.trace
             });
 
-        self.advance();
-        self.compact(trace);
-        self.compact(&mut result_trace);
-        worker.step_while(|| self.probed());
+        self.advance([trace, &mut result_trace], worker);
         self.read(&mut result_trace).into_iter().collect()
     }
 
@@ -299,10 +290,6 @@ impl Context {
             cursor.step_key(&storage);
         }
         ret
-    }
-
-    fn probed(&self) -> bool {
-        self.probe.less_than(self.input.time())
     }
 }
 
