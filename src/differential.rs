@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 use differential_dataflow::operators::arrange::{upsert, ArrangeByKey, TraceAgent};
-use differential_dataflow::operators::Join;
+use differential_dataflow::operators::{Iterate, Join, Reduce};
 use differential_dataflow::trace::implementations::ord::OrdValSpine;
 use differential_dataflow::trace::{Cursor, TraceReader};
 use differential_dataflow::AsCollection;
@@ -20,7 +21,7 @@ use crate::lineage::{Lineage, Name};
 
 struct Differential {
     tx: Sender<Message>,
-    thread: Option<JoinHandle<()>>,
+    _thread: Option<JoinHandle<()>>,
 }
 
 pub fn new() -> Arc<dyn Lineage> {
@@ -28,7 +29,7 @@ pub fn new() -> Arc<dyn Lineage> {
     let thread = std::thread::spawn(move || run(rx));
     Arc::new(Differential {
         tx,
-        thread: Some(thread),
+        _thread: Some(thread),
     })
 }
 
@@ -47,12 +48,18 @@ impl Lineage for Differential {
         rx.recv().unwrap()
     }
 
-    fn dependencies_all(&self, name: Name, k: usize) -> Vec<Name> {
-        todo!()
+    fn dependencies_cascade(&self, name: Name) -> HashMap<Name, Vec<Name>> {
+        let (tx, rx) = bounded(1);
+        let req = Message::DependenciesCascade { name, tx };
+        self.tx.send(req).unwrap();
+        rx.recv().unwrap()
     }
 
-    fn dependents_all(&self, name: Name, k: usize) -> Vec<Name> {
-        todo!()
+    fn dependents_cascade(&self, name: Name) -> HashMap<Name, Vec<Name>> {
+        let (tx, rx) = bounded(1);
+        let req = Message::DependentsCascade { name, tx };
+        self.tx.send(req).unwrap();
+        rx.recv().unwrap()
     }
 
     fn upsert(&self, name: Name, dependencies: Vec<Name>) {
@@ -67,10 +74,29 @@ impl Lineage for Differential {
 }
 
 enum Message {
-    Dependencies { name: Name, tx: Sender<Vec<Name>> },
-    Dependents { name: Name, tx: Sender<Vec<Name>> },
-    Upsert { name: Name, dependencies: Vec<Name> },
-    Delete { name: Name },
+    Dependencies {
+        name: Name,
+        tx: Sender<Vec<Name>>,
+    },
+    Dependents {
+        name: Name,
+        tx: Sender<Vec<Name>>,
+    },
+    DependenciesCascade {
+        name: Name,
+        tx: Sender<HashMap<Name, Vec<Name>>>,
+    },
+    DependentsCascade {
+        name: Name,
+        tx: Sender<HashMap<Name, Vec<Name>>>,
+    },
+    Upsert {
+        name: Name,
+        dependencies: Vec<Name>,
+    },
+    Delete {
+        name: Name,
+    },
 }
 
 type Key = Name;
@@ -79,8 +105,6 @@ type ValVec = Vec<Name>;
 type Timestamp = u64;
 type Spine = OrdValSpine<Key, Val, Timestamp, isize>;
 type TraceHandle = TraceAgent<Spine>;
-
-struct Config {}
 
 struct Context {
     input: Handle<Timestamp, (Key, Option<ValVec>, Timestamp)>,
@@ -135,6 +159,46 @@ impl Context {
         worker.step_while(|| self.probed());
         let mut result = self.read(&mut result_trace);
         result.pop().map(|d| d.1).unwrap_or(vec![])
+    }
+
+    fn query_cascade<A: Allocate>(
+        &mut self,
+        trace: &mut TraceHandle,
+        name: Name,
+        worker: &mut Worker<A>,
+    ) -> HashMap<Key, Vec<Val>> {
+        let current = self.counter;
+        let mut result_trace = worker.dataflow(|scope| {
+            let query = Some(name)
+                .to_stream(scope)
+                .map(move |x| (x, current, 1))
+                .as_collection();
+            let arranged = trace.import(scope);
+            let init = arranged.semijoin(&query);
+            let res = init
+                .iterate(|lineage| {
+                    let targets = lineage.map(|kv| kv.1);
+                    arranged
+                        .enter(&lineage.scope())
+                        .semijoin(&targets)
+                        .concat(lineage)
+                        .reduce(|_key, input, output| {
+                            for (v, _) in input {
+                                output.push(((*v).clone(), 1));
+                            }
+                        })
+                })
+                .arrange_by_key();
+
+            res.stream.probe_with(&mut self.probe);
+            res.trace
+        });
+
+        self.advance();
+        self.compact(trace);
+        self.compact(&mut result_trace);
+        worker.step_while(|| self.probed());
+        self.read(&mut result_trace).into_iter().collect()
     }
 
     fn read(&self, trace: &mut TraceHandle) -> Vec<(Key, Vec<Val>)> {
@@ -208,6 +272,14 @@ fn run(rx: Receiver<Message>) {
                 }
                 Message::Dependents { name, tx } => {
                     let d = ctx.query(&mut downstream, name, worker);
+                    tx.send(d).unwrap();
+                }
+                Message::DependenciesCascade { name, tx } => {
+                    let d = ctx.query_cascade(&mut upstream, name, worker);
+                    tx.send(d).unwrap();
+                }
+                Message::DependentsCascade { name, tx } => {
+                    let d = ctx.query_cascade(&mut downstream, name, worker);
                     tx.send(d).unwrap();
                 }
                 Message::Upsert { name, dependencies } => {
