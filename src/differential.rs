@@ -62,6 +62,20 @@ impl Lineage for Differential {
         rx.recv().unwrap()
     }
 
+    fn dependencies_k(&self, name: Name, k: usize) -> HashMap<Name, Vec<Name>> {
+        let (tx, rx) = bounded(1);
+        let req = Message::DependenciesK { name, k, tx };
+        self.tx.send(req).unwrap();
+        rx.recv().unwrap()
+    }
+
+    fn dependents_k(&self, name: Name, k: usize) -> HashMap<Name, Vec<Name>> {
+        let (tx, rx) = bounded(1);
+        let req = Message::DependentsK { name, k, tx };
+        self.tx.send(req).unwrap();
+        rx.recv().unwrap()
+    }
+
     fn upsert(&self, name: Name, dependencies: Vec<Name>) {
         let req = Message::Upsert { name, dependencies };
         self.tx.send(req).unwrap();
@@ -88,6 +102,16 @@ enum Message {
     },
     DependentsCascade {
         name: Name,
+        tx: Sender<HashMap<Name, Vec<Name>>>,
+    },
+    DependenciesK {
+        name: Name,
+        k: usize,
+        tx: Sender<HashMap<Name, Vec<Name>>>,
+    },
+    DependentsK {
+        name: Name,
+        k: usize,
         tx: Sender<HashMap<Name, Vec<Name>>>,
     },
     Upsert {
@@ -201,6 +225,48 @@ impl Context {
         self.read(&mut result_trace).into_iter().collect()
     }
 
+    fn query_k<A: Allocate>(
+        &mut self,
+        trace: &mut TraceHandle,
+        name: Name,
+        worker: &mut Worker<A>,
+        k: usize,
+    ) -> HashMap<Key, Vec<Val>> {
+        if k == 0 {
+            return HashMap::new();
+        }
+
+        let current = self.counter;
+        let mut result_trace =
+            worker.dataflow(|scope| {
+                let query = Some(name)
+                    .to_stream(scope)
+                    .map(move |x| (x, current, 1))
+                    .as_collection();
+                let arranged = trace.import(scope);
+                let mut lineage = arranged.semijoin(&query);
+                for _ in 0..(k - 1) {
+                    let targets = lineage.map(|kv| kv.1);
+                    lineage = arranged.semijoin(&targets).concat(&lineage).reduce(
+                        |_key, input, output| {
+                            for (v, _) in input {
+                                output.push(((*v).clone(), 1));
+                            }
+                        },
+                    )
+                }
+                let res = lineage.arrange_by_key();
+                res.stream.probe_with(&mut self.probe);
+                res.trace
+            });
+
+        self.advance();
+        self.compact(trace);
+        self.compact(&mut result_trace);
+        worker.step_while(|| self.probed());
+        self.read(&mut result_trace).into_iter().collect()
+    }
+
     fn read(&self, trace: &mut TraceHandle) -> Vec<(Key, Vec<Val>)> {
         use timely::PartialOrder;
 
@@ -280,6 +346,14 @@ fn run(rx: Receiver<Message>) {
                 }
                 Message::DependentsCascade { name, tx } => {
                     let d = ctx.query_cascade(&mut downstream, name, worker);
+                    tx.send(d).unwrap();
+                }
+                Message::DependenciesK { name, k, tx } => {
+                    let d = ctx.query_k(&mut upstream, name, worker, k);
+                    tx.send(d).unwrap();
+                }
+                Message::DependentsK { name, k, tx } => {
+                    let d = ctx.query_k(&mut downstream, name, worker, k);
                     tx.send(d).unwrap();
                 }
                 Message::Upsert { name, dependencies } => {

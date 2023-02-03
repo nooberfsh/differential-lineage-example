@@ -8,6 +8,8 @@ pub trait Lineage {
     fn dependents(&self, name: Name) -> Vec<Name>;
     fn dependencies_cascade(&self, name: Name) -> HashMap<Name, Vec<Name>>;
     fn dependents_cascade(&self, name: Name) -> HashMap<Name, Vec<Name>>;
+    fn dependencies_k(&self, name: Name, k: usize) -> HashMap<Name, Vec<Name>>;
+    fn dependents_k(&self, name: Name, k: usize) -> HashMap<Name, Vec<Name>>;
     // update
     fn upsert(&self, name: Name, dependencies: Vec<Name>);
     fn delete(&self, name: Name);
